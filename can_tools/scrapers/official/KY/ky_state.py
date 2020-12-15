@@ -1,25 +1,29 @@
 import io
 import zipfile
-from typing import Optional
+from typing import Optional, List
+from functools import reduce
 
 import requests
 import us
+import pandas as pd
+
+import tabula
 
 import logging
 
-from can_tools.scrapers.base import CMU, DatasetBaseNeedsDate
+from can_tools.scrapers.base import CMU, DatasetBase
 from can_tools.scrapers.official.base import StateDashboard
 
 logger = logging.getLogger(__name__)
 
 
-class Kentucky(DatasetBaseNeedsDate, StateDashboard):
+class Kentucky(DatasetBase, StateDashboard):
     start_date = "2019-04-29"
     source = (
         "https://www.mass.gov/info-details/"
         "covid-19-response-reporting#covid-19-daily-dashboard-"
     )
-    state_fips = int(us.states.lookup("Massachusetts").fips)
+    state_fips = int(us.states.lookup("Kentucky").fips)
     has_location = False
 
     def transform_date(self, date: pd.Timestamp) -> pd.Timestamp:
@@ -94,22 +98,65 @@ class Kentucky(DatasetBaseNeedsDate, StateDashboard):
         )
 
     def get(self, date: str) -> pd.DataFrame:
-        dt = pd.to_datetime(date)
-        ds = dt.strftime("%B-%-d-%Y").lower()
-        url = f"https://www.mass.gov/doc/covid-19-raw-data-{ds}/download"
-        res = requests.get(url)
-        if not res.ok:
-            msg = f"Failed request to {url} with code{res.status_code} and message {res.content}"
-            raise ValueError(msg)
 
-        buf = io.BytesIO(res.content)
-        buf.seek(0)
+        file = "https://chfs.ky.gov/agencies/dph/covid19/COVID19DailyReport.pdf"
+        tables: List[pd.DataFrame] = tabula.read_pdf(file, pages="all", multiple_tables=True)
+
         dfs = []
-        with zipfile.ZipFile(buf) as f:
-            dfs.append(self._get_hospital_data(f, dt))
-            dfs.append(self._get_cases_deaths(f))
+        start = False
+        for df in tables:
 
-        df = pd.concat([x for x in dfs if x is not None], ignore_index=True)
+            if start:
+                if (df.iloc[:, 0] == "Total").any():
+                    start = False
+
+                dfs.append(df)
+
+            elif {"County", "New Cases"}.issubset(set(df.columns)):
+                dfs.append(df)
+                start = True
+            else:
+                pass
+
+        dt = pd.to_datetime(date)
+
+        def reducer(left_df: pd.DataFrame, right_df: pd.DataFrame) -> pd.DataFrame:
+            if {"County", "New Cases"}.issubset(set(left_df.columns)):
+                if {"County", "New Cases"}.issubset(set(right_df.columns)):
+                    return pd.concat([left_df, right_df], ignore_index=True)
+                else:
+                    return pd.concat(
+                        (
+                            left_df,
+                            right_df.T.reset_index().T.rename(
+                                columns={0: "County", 1: "New Cases", 2: "Percent"}
+                            ).reset_index(drop=True)
+                        ), ignore_index=True
+                    )
+            else:
+                if {"County", "New Cases"}.issubset(set(right_df.columns)):
+                    return pd.concat(
+                        (
+                            right_df,
+                            left_df.T.reset_index().T.rename(
+                                columns={0: "County", 1: "New Cases", 2: "Percent"}
+                            ).reset_index(drop=True)
+                        ), ignore_index=True
+                    )
+                else:
+                    return pd.concat(
+                        (
+                            right_df,
+                            left_df
+                        ), ignore_index=True
+                    ).T.reset_index().T.rename(
+                                columns={0: "County", 1: "New Cases", 2: "Percent"}
+                            ).reset_index(drop=True)
+
+        df = reduce(lambda left, right: reducer(left, right), dfs)
+
+        df["last_updated"] = dt
+
         df["value"] = df["value"].astype(int)
         df["vintage"] = self._retrieve_vintage()
         return df
